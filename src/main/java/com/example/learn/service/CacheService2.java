@@ -1,9 +1,13 @@
 package com.example.learn.service;
 
+import com.example.learn.pojo.User;
+import com.example.learn.repository.UserRepository;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -11,7 +15,8 @@ import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 @Service
-public class CacheService {
+@EnableAsync
+public class CacheService2 {
 
     @Autowired
     private RedissonClient redissonClient;
@@ -19,12 +24,14 @@ public class CacheService {
     @Autowired
     private StringRedisTemplate redisTemplate;
 
+    @Autowired
+    private UserRepository userRepository;
+
     public String getData(String key) {
         String cacheKey = "cache:" + key;
         String lockKey = "lock:" + key;
         String cachedValue = redisTemplate.opsForValue().get(cacheKey);
 
-        // 缓存穿透处理：缓存中不存在，数据库中也不存在，缓存空值
         if (cachedValue != null) {
             if ("null".equals(cachedValue)) {
                 return null;
@@ -38,19 +45,17 @@ public class CacheService {
             boolean acquired = lock.tryLock(10, 5, TimeUnit.SECONDS);
             if (acquired) {
                 try {
-                    // 再次检查缓存是否被其他线程更新
                     cachedValue = redisTemplate.opsForValue().get(cacheKey);
                     if (cachedValue != null) {
                         return cachedValue;
                     }
 
-                    // 模拟查询数据库
                     String dbValue = queryFromDatabase(key);
 
                     if (dbValue == null) {
                         redisTemplate.opsForValue().set(cacheKey, "null", 10, TimeUnit.MINUTES);
                     } else {
-                        int randomExpiration = new Random().nextInt(10); // 缓存雪崩处理：随机化过期时间
+                        int randomExpiration = new Random().nextInt(10);
                         redisTemplate.opsForValue().set(cacheKey, dbValue, 30 + randomExpiration, TimeUnit.MINUTES);
                     }
                     return dbValue;
@@ -58,7 +63,6 @@ public class CacheService {
                     lock.unlock();
                 }
             } else {
-                // 未能获取锁，等待一段时间再尝试获取缓存
                 Thread.sleep(50);
                 return getData(key);
             }
@@ -68,17 +72,15 @@ public class CacheService {
         }
     }
 
-    // 模拟查询数据库
-    private String queryFromDatabase(String key) {
-        // 模拟数据库查询逻辑
-        if ("validKey".equals(key)) {
-            return "validValue";
-        }
-        return null;
-    }
 
+    /**
+     * 延时双删
+     * @param key
+     * @param newValue
+     */
     @Transactional
     public void updateData(String key, String newValue) {
+        String cacheKey = "cache:" + key;
         String lockKey = "lock:" + key;
         RLock lock = redissonClient.getLock(lockKey);
 
@@ -86,19 +88,20 @@ public class CacheService {
             boolean acquired = lock.tryLock(10, 5, TimeUnit.SECONDS);
             if (acquired) {
                 try {
+                    // 先删除缓存
+                    redisTemplate.delete(cacheKey);
+
                     // 更新数据库
                     boolean dbUpdateSuccess = updateDatabase(key, newValue);
 
                     if (dbUpdateSuccess) {
-                        // 删除缓存
-                        String cacheKey = "cache:" + key;
-                        redisTemplate.delete(cacheKey);
+                        // 延时双删策略：延迟后再次删除缓存
+                        deleteCacheWithDelay(cacheKey, 5);
                     }
                 } finally {
                     lock.unlock();
                 }
             } else {
-                // 未能获取锁，等待一段时间再尝试更新数据
                 Thread.sleep(50);
                 updateData(key, newValue);
             }
@@ -107,13 +110,31 @@ public class CacheService {
         }
     }
 
+    @Async
+    public void deleteCacheWithDelay(String cacheKey, int delayInSeconds) {
+        try {
+            TimeUnit.SECONDS.sleep(delayInSeconds);
+            redisTemplate.delete(cacheKey);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     // 模拟更新数据库
     private boolean updateDatabase(String key, String newValue) {
         // 模拟数据库更新逻辑
-        if ("validKey".equals(key)) {
-            // 假设数据库更新成功
+        User user = userRepository.findById(Long.parseLong(key)).orElse(null);
+        if (user != null) {
+            user.setUsername(newValue);
+            userRepository.save(user);
             return true;
         }
         return false;
+    }
+
+    // 模拟查询数据库
+    private String queryFromDatabase(String key) {
+        User user = userRepository.findById(Long.parseLong(key)).orElse(null);
+        return user != null ? user.getUsername() : null;
     }
 }
